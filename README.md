@@ -48,8 +48,8 @@ Immich doesn't allow transferring photo ownership between users from the UI. Thi
 
 ## Requirements
 
-- Python 3.8+
-- Access to Immich API (admin API Key)
+- Python 3.11+
+- Access to Immich API (API Key)
 - Direct access to Immich's PostgreSQL database
 
 ---
@@ -111,11 +111,22 @@ On first run, the tool will guide you through configuration:
 │  3.  Transfer album (dry run)       │
 │  4.  Transfer album (EXECUTE)       │
 ├─────────────────────────────────────┤
-│  5.  Reconfigure                    │
-│  6.  Clear config                   │
+│  5.  Repair faces (dry run)         │
+│  6.  Repair faces (EXECUTE)         │
+├─────────────────────────────────────┤
+│  7.  Reconfigure                    │
+│  8.  Clear config                   │
 │  0.  Exit                           │
 └─────────────────────────────────────┘
 ```
+
+### Repair Faces
+
+Use options 5-6 if you transferred photos **manually** (without this tool) and faces are broken. This will:
+1. Find faces linked to the wrong user's persons
+2. Duplicate those persons for the correct user
+3. Re-link the faces to the new persons
+4. Attempt to fix broken profile pictures
 
 ---
 
@@ -125,10 +136,14 @@ On first run, the tool will guide you through configuration:
 > **Always test with dry-run mode first!**
 > 
 > 1. **Make a backup** (see above)
-> 2. **List albums** (option 2) → get the album ID
-> 3. **List users** (option 1) → get the destination user ID  
-> 4. **Dry run first** (option 3) → see what will be transferred
-> 5. **Execute transfer** (option 4) → only if dry run looks correct
+> 2. **Dry run first** (option 3) → select source user, album, and destination user interactively
+> 3. **Execute transfer** (option 4) → only if dry run looks correct
+
+The tool will guide you step by step:
+1. Select the source user (who owns the album)
+2. Select the album to transfer
+3. Select the destination user
+4. Confirm and execute
 
 ### What is Dry Run?
 
@@ -174,51 +189,73 @@ DB_CONFIG = {
 ### PostgreSQL Connection
 
 > [!IMPORTANT]
-> By default, PostgreSQL in Immich **is not exposed** outside Docker.
-> 
-> You have two options:
+> By default, PostgreSQL in Immich **is not exposed** outside Docker. You need to temporarily expose the port.
 
-#### Option A: Run from Immich server ✅ (recommended)
+#### Step 1: Expose PostgreSQL port
+
+Find your Immich's `docker-compose.yml`:
 
 ```bash
-# From your PC, copy files to server
-scp -r immich-transfer/ user@your-server:/root/
-
-# On the server
-ssh user@your-server
-cd /root/immich-transfer
-pip install -r requirements.txt
-python transfer.py
+# Usually in /opt/immich/ or check with:
+docker inspect immich_server | grep "compose.project.config_files"
 ```
 
-In `config.py` use the container hostname:
-```python
-DB_CONFIG = {
-    "host": "immich_postgres",
-    ...
-}
-```
-
-#### Option B: Expose PostgreSQL port ⚠️ (less secure)
-
-Edit your `docker-compose.yml`:
+Edit `docker-compose.yml` and add `ports` to the database service:
 
 ```yaml
-immich_postgres:
+database:
+  container_name: immich_postgres
+  # ... other config ...
   ports:
     - "5432:5432"
 ```
 
-Then restart: `docker compose up -d`
-
-> [!CAUTION]
-> This exposes your database to the local network. Only do this if you trust your network.
-
-### Finding PostgreSQL password
+Restart Immich:
 
 ```bash
-docker exec -t immich_postgres env | grep POSTGRES_PASSWORD
+cd /opt/immich  # or your immich directory
+docker compose up -d
 ```
+
+#### Step 2: Run the tool from your PC
+
+```bash
+python transfer.py
+```
+
+Use your server's IP as the database host (e.g., `192.168.1.6`).
+
+#### Step 3: Close the port after use (recommended)
+
+Once you're done transferring, remove or comment out the `ports` section and restart:
+
+```yaml
+database:
+  container_name: immich_postgres
+  # ... other config ...
+  # ports:
+  #   - "5432:5432"
+```
+
+```bash
+docker compose up -d
+```
+
+> [!NOTE]
+> If you're on a trusted local network, leaving the port open is not a major security risk. But it's good practice to close it when not needed.
+
+### Finding PostgreSQL credentials
+
+Check the `.env` file in your Immich directory:
+
+```bash
+cat /opt/immich/.env | grep DB_
+```
+
+You'll see:
+- `DB_PASSWORD` - Database password
+- `DB_USERNAME` - Database user (usually `immich`)
+- `DB_DATABASE_NAME` - Database name (usually `immichdb`)
 
 ---
 
@@ -292,7 +329,7 @@ The tool analyzes each person that appears in the album:
 |-----------|---------|
 | Immich | v2.3.1 |
 | PostgreSQL | 14 |
-| Python | 3.8+ |
+| Python | 3.11+ |
 
 ---
 
@@ -301,6 +338,24 @@ The tool analyzes each person that appears in the album:
 - Only transfers by album (not by tag — could be added)
 - Requires direct database access
 - Doesn't move physical files (only changes ownership in DB)
+- Album ownership is not transferred (only the assets inside)
+
+---
+
+## Known Issues
+
+> [!WARNING]
+> **After transfer, duplicated persons are independent.**
+> 
+> When a person is duplicated (appears in both users' photos), they become **separate persons** in each user's library. This means:
+> - "Mom" in User A and "Mom" in User B are **different** persons
+> - Changes to one don't affect the other
+> - You may need to manually set profile pictures for duplicated persons
+
+> [!NOTE]
+> **Profile pictures for duplicated persons may need to be set manually.**
+> 
+> The tool attempts to set a profile picture automatically, but in some cases you may need to select a face thumbnail manually in Immich's People section.
 
 ---
 

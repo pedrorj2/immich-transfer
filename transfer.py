@@ -264,7 +264,7 @@ class ImmichTransfer:
         cur.execute("""
             SELECT DISTINCT af."personId"
             FROM asset_face af
-            WHERE af."assetId" = ANY(%s) AND af."personId" IS NOT NULL
+            WHERE af."assetId"::text = ANY(%s) AND af."personId" IS NOT NULL
         """, (asset_ids,))
         person_ids = [row[0] for row in cur.fetchall()]
         
@@ -288,8 +288,8 @@ class ImmichTransfer:
             # Contar caras dentro y fuera de los assets a transferir
             cur.execute("""
                 SELECT 
-                    COUNT(*) FILTER (WHERE "assetId" = ANY(%s)) as faces_in_transfer,
-                    COUNT(*) FILTER (WHERE "assetId" != ALL(%s)) as faces_outside
+                    COUNT(*) FILTER (WHERE "assetId"::text = ANY(%s)) as faces_in_transfer,
+                    COUNT(*) FILTER (WHERE "assetId"::text != ALL(%s)) as faces_outside
                 FROM asset_face
                 WHERE "personId" = %s
             """, (asset_ids, asset_ids, person_id))
@@ -319,7 +319,7 @@ class ImmichTransfer:
         conn = self.connect_db()
         cur = conn.cursor()
         cur.execute("""
-            UPDATE asset SET "ownerId" = %s WHERE id = ANY(%s)
+            UPDATE asset SET "ownerId" = %s WHERE id::text = ANY(%s)
         """, (new_owner_id, asset_ids))
         count = cur.rowcount
         conn.commit()
@@ -345,53 +345,51 @@ class ImmichTransfer:
         conn = self.connect_db()
         cur = conn.cursor()
         
-        # Obtener datos de la persona original
-        cur.execute("""
-            SELECT name, "isHidden", "birthDate", "isFavorite", color
-            FROM person WHERE id = %s
-        """, (person_id,))
-        original = cur.fetchone()
-        
-        if not original:
-            cur.close()
-            return None
-        
-        # Crear nueva persona para el nuevo usuario
-        new_person_id = str(uuid.uuid4())
-        cur.execute("""
-            INSERT INTO person (id, "ownerId", name, "isHidden", "birthDate", "isFavorite", color, "createdAt", "updatedAt")
-            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
-        """, (new_person_id, new_owner_id, original[0], original[1], original[2], original[3], original[4]))
-        
-        # Re-vincular las caras de los assets transferidos a la nueva persona
-        cur.execute("""
-            UPDATE asset_face 
-            SET "personId" = %s 
-            WHERE "personId" = %s AND "assetId" = ANY(%s)
-        """, (new_person_id, person_id, asset_ids))
-        
-        # Copiar embeddings de las caras transferidas
-        cur.execute("""
-            SELECT af.id 
-            FROM asset_face af 
-            WHERE af."personId" = %s
-        """, (new_person_id,))
-        new_face_ids = [row[0] for row in cur.fetchall()]
-        
-        # Actualizar faceAssetId de la nueva persona (usar la primera cara disponible)
-        if new_face_ids:
+        try:
+            # Obtener datos de la persona original
             cur.execute("""
-                SELECT "assetId" FROM asset_face WHERE id = %s
-            """, (new_face_ids[0],))
-            first_asset = cur.fetchone()
-            if first_asset:
+                SELECT name, "isHidden", "birthDate", "isFavorite", color
+                FROM person WHERE id = %s
+            """, (person_id,))
+            original = cur.fetchone()
+            
+            if not original:
+                cur.close()
+                return None
+            
+            # Crear nueva persona para el nuevo usuario (sin faceAssetId inicialmente)
+            new_person_id = str(uuid.uuid4())
+            cur.execute("""
+                INSERT INTO person (id, "ownerId", name, "isHidden", "birthDate", "isFavorite", color, "createdAt", "updatedAt")
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+            """, (new_person_id, new_owner_id, original[0], original[1], original[2], original[3], original[4]))
+            
+            # Re-vincular las caras de los assets transferidos a la nueva persona
+            cur.execute("""
+                UPDATE asset_face 
+                SET "personId" = %s 
+                WHERE "personId" = %s AND "assetId"::text = ANY(%s)
+            """, (new_person_id, person_id, asset_ids))
+            
+            # Obtener una cara de la nueva persona para usarla como foto de perfil
+            cur.execute("""
+                SELECT id FROM asset_face WHERE "personId" = %s LIMIT 1
+            """, (new_person_id,))
+            face_row = cur.fetchone()
+            
+            if face_row:
                 cur.execute("""
                     UPDATE person SET "faceAssetId" = %s WHERE id = %s
-                """, (first_asset[0], new_person_id))
-        
-        conn.commit()
-        cur.close()
-        return new_person_id
+                """, (face_row[0], new_person_id))
+            
+            conn.commit()
+            cur.close()
+            return new_person_id
+            
+        except Exception as e:
+            conn.rollback()
+            cur.close()
+            raise e
     
     def transfer_album_with_faces(self, album_id: str, new_owner_id: str, dry_run: bool = True) -> dict:
         """
@@ -497,6 +495,180 @@ class ImmichTransfer:
             print(f"\n  ✗ ERROR: {e}")
         
         return result
+    
+    def repair_faces_for_user(self, user_id: str, dry_run: bool = True) -> dict:
+        """
+        Repairs faces after a manual transfer.
+        Finds faces in user's assets that belong to other users' persons,
+        and duplicates those persons for the correct user.
+        
+        Args:
+            user_id: The user whose assets need face repair
+            dry_run: If True, only simulate without making changes
+        
+        Returns:
+            dict with operation summary
+        """
+        result = {
+            "faces_found": 0,
+            "persons_duplicated": 0,
+            "errors": []
+        }
+        
+        conn = self.connect_db()
+        cur = conn.cursor()
+        
+        # Find faces in user's assets that belong to other users' persons
+        cur.execute("""
+            SELECT DISTINCT p.id as person_id, p."ownerId" as person_owner, p.name,
+                   COUNT(af.id) as face_count
+            FROM asset a
+            JOIN asset_face af ON a.id = af."assetId"
+            JOIN person p ON af."personId" = p.id
+            WHERE a."ownerId" = %s 
+              AND p."ownerId" != %s
+              AND af."personId" IS NOT NULL
+            GROUP BY p.id, p."ownerId", p.name
+            ORDER BY p.name
+        """, (user_id, user_id))
+        
+        broken_persons = cur.fetchall()
+        
+        print(f"\n  ┌────────────────────────────────────────────────────┐")
+        print(f"  │              FACE REPAIR ANALYSIS                   │")
+        print(f"  └────────────────────────────────────────────────────┘")
+        
+        if not broken_persons:
+            print(f"\n  ✓ No broken face links found!")
+            cur.close()
+            
+            if not dry_run:
+                # Still check for broken thumbnails
+                print(f"\n  Checking for broken profile pictures...")
+                thumbnails_fixed = self.fix_broken_thumbnails(user_id)
+                result["thumbnails_fixed"] = thumbnails_fixed
+                if thumbnails_fixed > 0:
+                    print(f"\n  ✓ Fixed {thumbnails_fixed} profile pictures")
+                else:
+                    print(f"  ✓ All profile pictures are OK")
+            
+            return result
+        
+        print(f"\n  Found {len(broken_persons)} persons that need to be duplicated:\n")
+        
+        total_faces = 0
+        for person in broken_persons:
+            person_id, person_owner, name, face_count = person
+            total_faces += face_count
+            print(f"    → {name or 'Unnamed'} ({face_count} faces)")
+        
+        result["faces_found"] = total_faces
+        
+        if dry_run:
+            print(f"\n  ┌────────────────────────────────────────────────────┐")
+            print(f"  │                    DRY RUN                         │")
+            print(f"  │              No changes were made                  │")
+            print(f"  └────────────────────────────────────────────────────┘")
+            print(f"\n  Would duplicate {len(broken_persons)} persons")
+            print(f"  Would fix {total_faces} face links")
+            cur.close()
+            return result
+        
+        # Execute repair
+        print(f"\n  Repairing faces...")
+        
+        for person in broken_persons:
+            person_id, person_owner, name, face_count = person
+            
+            try:
+                # Get all asset IDs from this user that have faces linked to this person
+                cur.execute("""
+                    SELECT DISTINCT a.id::text
+                    FROM asset a
+                    JOIN asset_face af ON a.id = af."assetId"
+                    WHERE a."ownerId" = %s AND af."personId" = %s
+                """, (user_id, person_id))
+                asset_ids = [row[0] for row in cur.fetchall()]
+                
+                # Duplicate the person for the new user
+                new_person_id = self.duplicate_person_for_user(person_id, user_id, asset_ids)
+                
+                if new_person_id:
+                    result["persons_duplicated"] += 1
+                    print(f"    ✓ {name or 'Unnamed'}: duplicated ({face_count} faces fixed)")
+                else:
+                    result["errors"].append(f"Failed to duplicate {name or person_id}")
+                    
+            except Exception as e:
+                result["errors"].append(f"Error with {name or person_id}: {str(e)}")
+        
+        cur.close()
+        
+        # Also fix broken profile pictures
+        print(f"\n  Fixing profile pictures...")
+        thumbnails_fixed = self.fix_broken_thumbnails(user_id)
+        result["thumbnails_fixed"] = thumbnails_fixed
+        
+        print(f"\n  ┌────────────────────────────────────────────────────┐")
+        print(f"  │              REPAIR COMPLETED                       │")
+        print(f"  └────────────────────────────────────────────────────┘")
+        print(f"\n  Summary:")
+        print(f"    • Persons duplicated:  {result['persons_duplicated']}")
+        print(f"    • Faces fixed:         {total_faces}")
+        print(f"    • Thumbnails fixed:    {thumbnails_fixed}")
+        if result["errors"]:
+            print(f"    • Errors: {len(result['errors'])}")
+            for err in result["errors"]:
+                print(f"      - {err}")
+        
+        return result
+    
+    def fix_broken_thumbnails(self, user_id: Optional[str] = None) -> int:
+        """
+        Fixes persons with NULL or invalid faceAssetId.
+        If user_id is provided, only fixes for that user.
+        Returns number of thumbnails fixed.
+        """
+        conn = self.connect_db()
+        cur = conn.cursor()
+        
+        # Find persons with NULL faceAssetId or invalid faceAssetId
+        if user_id:
+            cur.execute("""
+                SELECT p.id, p.name
+                FROM person p
+                WHERE p."ownerId" = %s
+                  AND (p."faceAssetId" IS NULL 
+                       OR NOT EXISTS (SELECT 1 FROM asset_face af WHERE af.id = p."faceAssetId"))
+            """, (user_id,))
+        else:
+            cur.execute("""
+                SELECT p.id, p.name
+                FROM person p
+                WHERE p."faceAssetId" IS NULL 
+                   OR NOT EXISTS (SELECT 1 FROM asset_face af WHERE af.id = p."faceAssetId")
+            """)
+        
+        broken_persons = cur.fetchall()
+        fixed_count = 0
+        
+        for person_id, name in broken_persons:
+            # Find a valid face for this person
+            cur.execute("""
+                SELECT id FROM asset_face WHERE "personId" = %s LIMIT 1
+            """, (person_id,))
+            face_row = cur.fetchone()
+            
+            if face_row:
+                cur.execute("""
+                    UPDATE person SET "faceAssetId" = %s WHERE id = %s
+                """, (face_row[0], person_id))
+                fixed_count += 1
+                print(f"    ✓ {name or 'Unnamed'}: thumbnail fixed")
+        
+        conn.commit()
+        cur.close()
+        return fixed_count
 
 
 def main():
@@ -523,8 +695,11 @@ def main():
         print("  │  3.  Transfer album (dry run)       │")
         print("  │  4.  Transfer album (EXECUTE)       │")
         print("  ├─────────────────────────────────────┤")
-        print("  │  5.  Reconfigure                    │")
-        print("  │  6.  Clear config                   │")
+        print("  │  5.  Repair faces (dry run)         │")
+        print("  │  6.  Repair faces (EXECUTE)         │")
+        print("  ├─────────────────────────────────────┤")
+        print("  │  7.  Reconfigure                    │")
+        print("  │  8.  Clear config                   │")
         print("  │  0.  Exit                           │")
         print("  └─────────────────────────────────────┘")
         
@@ -554,42 +729,132 @@ def main():
                 print(f"  ✗ Error: {e}")
             input("\n  Press Enter to continue...")
         
-        elif choice == "3":
-            print_section("TRANSFER ALBUM (Dry Run)")
-            album_id = input("  Album ID: ").strip()
+        elif choice == "3" or choice == "4":
+            is_dry_run = choice == "3"
+            print_section("TRANSFER ALBUM" + (" (Dry Run)" if is_dry_run else " (EXECUTE)"))
+            
+            if not is_dry_run:
+                print("  ⚠ WARNING: This will modify the database!")
+                print()
+            
             try:
+                # 1. Select source user
                 users = transfer.get_users()
-                print("\n  Available users:")
-                for u in users:
-                    print(f"    - {u['name']} (ID: {u['id']})")
-                new_owner = input("\n  New owner ID: ").strip()
-                transfer.transfer_album_with_faces(album_id, new_owner, dry_run=True)
-            except Exception as e:
-                print(f"  ✗ Error: {e}")
-            input("\n  Press Enter to continue...")
-        
-        elif choice == "4":
-            print_section("TRANSFER ALBUM (EXECUTE)")
-            print("  ⚠ WARNING: This will modify the database!")
-            print()
-            album_id = input("  Album ID: ").strip()
-            try:
-                users = transfer.get_users()
-                print("\n  Available users:")
-                for u in users:
-                    print(f"    - {u['name']} (ID: {u['id']})")
-                new_owner = input("\n  New owner ID: ").strip()
+                print("  Select SOURCE user (transfer FROM):\n")
+                for i, u in enumerate(users, 1):
+                    print(f"    {i}. {u['name']}")
                 
-                confirm = input("\n  ARE YOU SURE? Type 'yes' to confirm: ").strip().lower()
-                if confirm == 'yes':
-                    transfer.transfer_album_with_faces(album_id, new_owner, dry_run=False)
+                src_choice = input("\n  > ").strip()
+                if not src_choice.isdigit() or int(src_choice) < 1 or int(src_choice) > len(users):
+                    print("  ✗ Invalid selection")
+                    input("\n  Press Enter to continue...")
+                    continue
+                source_user = users[int(src_choice) - 1]
+                
+                # 2. Get albums from source user
+                albums = transfer.get_all_albums_db()
+                user_albums = [a for a in albums if a['ownerId'] == source_user['id']]
+                
+                if not user_albums:
+                    print(f"\n  ✗ No albums found for {source_user['name']}")
+                    input("\n  Press Enter to continue...")
+                    continue
+                
+                print(f"\n  Albums from {source_user['name']}:\n")
+                for i, a in enumerate(user_albums, 1):
+                    print(f"    {i}. {a['albumName']} ({a['assetCount']} items)")
+                
+                album_choice = input("\n  > ").strip()
+                if not album_choice.isdigit() or int(album_choice) < 1 or int(album_choice) > len(user_albums):
+                    print("  ✗ Invalid selection")
+                    input("\n  Press Enter to continue...")
+                    continue
+                selected_album = user_albums[int(album_choice) - 1]
+                
+                # 3. Select destination user
+                other_users = [u for u in users if u['id'] != source_user['id']]
+                if not other_users:
+                    print("\n  ✗ No other users available")
+                    input("\n  Press Enter to continue...")
+                    continue
+                
+                print(f"\n  Select DESTINATION user (transfer TO):\n")
+                for i, u in enumerate(other_users, 1):
+                    print(f"    {i}. {u['name']}")
+                
+                dest_choice = input("\n  > ").strip()
+                if not dest_choice.isdigit() or int(dest_choice) < 1 or int(dest_choice) > len(other_users):
+                    print("  ✗ Invalid selection")
+                    input("\n  Press Enter to continue...")
+                    continue
+                dest_user = other_users[int(dest_choice) - 1]
+                
+                # 4. Confirm
+                print(f"\n  ┌────────────────────────────────────────────────────┐")
+                print(f"  │                 TRANSFER SUMMARY                   │")
+                print(f"  └────────────────────────────────────────────────────┘")
+                print(f"\n  Album:       {selected_album['albumName']}")
+                print(f"  Items:       {selected_album['assetCount']}")
+                print(f"  From:        {source_user['name']}")
+                print(f"  To:          {dest_user['name']}")
+                
+                if is_dry_run:
+                    print("\n  Mode:        DRY RUN (no changes)")
+                    input("\n  Press Enter to analyze...")
+                    transfer.transfer_album_with_faces(selected_album['id'], dest_user['id'], dry_run=True)
                 else:
-                    print("\n  ✗ Cancelled.")
+                    print("\n  Mode:        EXECUTE (will modify database!)")
+                    confirm = input("\n  Type 'yes' to confirm: ").strip().lower()
+                    if confirm == 'yes':
+                        transfer.transfer_album_with_faces(selected_album['id'], dest_user['id'], dry_run=False)
+                    else:
+                        print("\n  ✗ Cancelled.")
+                
             except Exception as e:
                 print(f"  ✗ Error: {e}")
             input("\n  Press Enter to continue...")
         
-        elif choice == "5":
+        elif choice == "5" or choice == "6":
+            is_dry_run = choice == "5"
+            print_section("REPAIR FACES" + (" (Dry Run)" if is_dry_run else " (EXECUTE)"))
+            
+            if not is_dry_run:
+                print("  ⚠ WARNING: This will modify the database!")
+                print()
+            
+            print("  This fixes faces after a manual photo transfer.")
+            print("  It finds faces linked to wrong users and duplicates")
+            print("  the persons for the correct user.\n")
+            
+            try:
+                users = transfer.get_users()
+                print("  Select user to repair faces for:\n")
+                for i, u in enumerate(users, 1):
+                    print(f"    {i}. {u['name']}")
+                
+                user_choice = input("\n  > ").strip()
+                if not user_choice.isdigit() or int(user_choice) < 1 or int(user_choice) > len(users):
+                    print("  ✗ Invalid selection")
+                    input("\n  Press Enter to continue...")
+                    continue
+                selected_user = users[int(user_choice) - 1]
+                
+                print(f"\n  Analyzing faces for {selected_user['name']}...")
+                
+                if is_dry_run:
+                    transfer.repair_faces_for_user(selected_user['id'], dry_run=True)
+                else:
+                    confirm = input(f"\n  Repair faces for {selected_user['name']}? Type 'yes' to confirm: ").strip().lower()
+                    if confirm == 'yes':
+                        transfer.repair_faces_for_user(selected_user['id'], dry_run=False)
+                    else:
+                        print("\n  ✗ Cancelled.")
+                
+            except Exception as e:
+                print(f"  ✗ Error: {e}")
+            input("\n  Press Enter to continue...")
+        
+        elif choice == "7":
             setup_config()
             print("\n  Restarting with new configuration...")
             # Reload
@@ -598,7 +863,7 @@ def main():
             importlib.reload(config)
             transfer = ImmichTransfer()
         
-        elif choice == "6":
+        elif choice == "8":
             confirm = input("\n  Clear all configuration? (y/n): ").strip().lower()
             if confirm == 'y':
                 clear_config()
